@@ -368,6 +368,7 @@ impl WebRtcSession {
                         let encoder_impl = match encoder {
                             crate::video::Encoder::Nvenc => "NVIDIA NVENC",
                             crate::video::Encoder::Vaapi => "VAAPI",
+                            crate::video::Encoder::Rkmpp => "Rockchip MPP",
                             crate::video::Encoder::Cpu => "Software",
                         };
                         if let Err(e) = sig.emit_event(crate::capability::FORWARD_SETTING_EVENT,

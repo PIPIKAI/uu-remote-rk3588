@@ -273,11 +273,12 @@ mod native {
             #[cfg(not(feature = "engine-plugins"))]
             let detailed = true;
             #[allow(unused_mut)]
-            let mut prefer_dmabuf = false;
-            #[cfg(feature = "inproc-av")]
-            if !virtual_output && crate::video::native_engine_eligible(crate::video_select::selection().encoder, crate::video::NativeDisplayKind::Portal)
-                && !std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v| v == "0") {
-                prefer_dmabuf = true;
+            let mut prefer_dmabuf = 0;
+            #[cfg(any(feature="inproc-av",all(target_os="linux",feature="native-rkmpp")))]
+            if !virtual_output && crate::video::native_engine_eligible(crate::video_select::selection().encoder,crate::video::NativeDisplayKind::Portal)
+                && !std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v|v=="0") {
+                // ARM tiling is only offered to MPP; VAAPI keeps its linear-only negotiation.
+                prefer_dmabuf=if crate::video_select::selection().encoder==crate::video::Encoder::Rkmpp {2} else {1};
             }
             let pointer = if detailed {
                 // Virtual shares can wait for consent too; cancel them like monitor opens.
@@ -286,18 +287,18 @@ mod native {
                 let cancel_data = cancel.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
                 unsafe { uu_portal_open_detailed(
                     restore, save_detailed, &mut cache as *mut _ as *mut c_void, callback, cancel_data,
-                    i32::from(prefer_dmabuf), if virtual_output { 4 } else { 1 },
+                    prefer_dmabuf, if virtual_output { 4 } else { 1 },
                     &mut error, &mut width, &mut height,
                 ) }
             } else {
                 #[allow(unused_mut)]
                 let mut pointer: *mut c_void = std::ptr::null_mut();
-                #[cfg(feature = "inproc-av")]
-                if prefer_dmabuf {
+                #[cfg(any(feature="inproc-av",all(target_os="linux",feature="native-rkmpp")))]
+                if prefer_dmabuf != 0 {
                     let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
                     let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
                     pointer = unsafe { uu_portal_open_persist_capture(
-                        restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
+                        restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, prefer_dmabuf,
                         &mut error, &mut width, &mut height,
                     ) };
                     if pointer.is_null() && error != 0 { return Err(failed(error, &cache)); }

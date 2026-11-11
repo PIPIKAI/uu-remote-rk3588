@@ -5,8 +5,17 @@ use webrtc::{media::Sample, peer_connection::{RTCPeerConnection, peer_connection
 use crate::{capture_setting::VideoCodec, desktop_session::PortalDesktop, video_track::VideoTrack};
 
 async fn black_frame(codec: VideoCodec) -> Result<Bytes, String> {
+    #[cfg(all(target_os="linux",feature="native-rkmpp"))]
+    if crate::video_select::selection().encoder==crate::video::Encoder::Rkmpp && crate::rkmpp::selected() {
+        match tokio::task::spawn_blocking(move || crate::rkmpp::black_frame(codec)).await {
+            Ok(Ok(frame))=>return Ok(frame),
+            Ok(Err(error))=>log::warn!("Locked video native MPP unavailable: {error}; falling back to FFmpeg"),
+            Err(_)=>log::warn!("Locked video native MPP worker failed; falling back to FFmpeg"),
+        }
+    }
     #[cfg(feature = "inproc-av")]
-    if crate::video::native_engine_eligible(crate::video_select::selection().encoder, crate::video::NativeDisplayKind::Portal) {
+    if crate::video_select::selection().encoder==crate::video::Encoder::Vaapi
+        && crate::video::native_engine_eligible(crate::video::Encoder::Vaapi, crate::video::NativeDisplayKind::Portal) {
         match tokio::task::spawn_blocking(move || crate::inproc_encoder::black_frame(codec)).await {
             Ok(Ok(frame)) => return Ok(frame),
             Ok(Err(error)) => log::warn!("Locked video in-process VAAPI unavailable: {error}; falling back to FFmpeg"),

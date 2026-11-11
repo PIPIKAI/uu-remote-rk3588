@@ -39,6 +39,7 @@ pub fn parse_encoder(value: Option<&str>) -> Option<Option<Encoder>> {
         Some(v) if v == "cpu" => Some(Some(Encoder::Cpu)),
         Some(v) if v == "vaapi" => Some(Some(Encoder::Vaapi)),
         Some(v) if v == "nvenc" => Some(Some(Encoder::Nvenc)),
+        Some(v) if v == "rkmpp" => Some(Some(Encoder::Rkmpp)),
         Some(_) => None,
     }
 }
@@ -258,7 +259,7 @@ pub struct SwitchPlan {
     /// Restart the encoder. None keeps the running encoder (codec-only or no change).
     pub encoder: Option<Encoder>,
     pub reason: SwitchReason,
-    /// Chroma the restarted encoder can actually produce. VAAPI has no 4:4:4.
+    /// Chroma the restarted encoder can actually produce. VAAPI/RKMPP use 4:2:0.
     pub chroma: u64,
     /// True when the request was 4:4:4 and the new encoder must report 4:2:0.
     pub chroma_downgraded: bool,
@@ -356,7 +357,7 @@ pub fn resolve_pair(
     let (encoder, encoder_source) = match parse_encoder(enc_setting) {
         Some(Some(e)) => (e, Source::Setting),
         None => {
-            log::warn!("Ignoring video_encoder value (not auto/cpu/vaapi/nvenc)");
+            log::warn!("Ignoring video_encoder value (not auto/cpu/vaapi/nvenc/rkmpp)");
             pick_encoder(enc_env, nvidia, probed)
         }
         Some(None) => pick_encoder(enc_env, nvidia, probed),
@@ -381,7 +382,7 @@ fn pick_encoder(env: Option<&str>, nvidia: bool, probed: Option<&ProbeReport>) -
     match parse_encoder(env) {
         Some(Some(e)) => (e, Source::Env),
         None => {
-            log::warn!("Ignoring UU_VIDEO_ENCODER value (not auto/cpu/vaapi/nvenc)");
+            log::warn!("Ignoring UU_VIDEO_ENCODER value (not auto/cpu/vaapi/nvenc/rkmpp)");
             (auto_encoder(nvidia, probed), Source::Auto)
         }
         Some(None) => (auto_encoder(nvidia, probed), Source::Auto),
@@ -411,7 +412,7 @@ pub fn codec_force(pref: CodecPref) -> Option<&'static str> {
     }
 }
 
-/// Hardware (VAAPI / NVENC) prefers H.265 unless the preference forces a codec.
+/// Hardware (VAAPI / NVENC / RKMPP) prefers H.265 unless the preference forces a codec.
 pub fn hardware(encoder: Encoder) -> bool {
     encoder != Encoder::Cpu
 }

@@ -23,6 +23,20 @@ fn main() {
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {
+        if std::env::var_os("CARGO_FEATURE_NATIVE_RKMPP").is_some() {
+            println!("cargo:rerun-if-changed=c_engine/rkmpp_engine.c");
+            println!("cargo:rerun-if-changed=c_engine/rkmpp_egl.inc");
+            let (flags, libs) = pkg_config(&["rockchip_mpp", "egl", "glesv2", "gbm", "libdrm"]).expect("native-rkmpp requires rockchip_mpp, librga, EGL/GLES2 and GBM development files");
+            let mut build=cc::Build::new();
+            build.file("c_engine/rkmpp_engine.c");
+            for flag in flags.split_whitespace() { build.flag(flag); }
+            build.compile("uu_rkmpp_engine");
+            for flag in libs.split_whitespace() {
+                if let Some(lib)=flag.strip_prefix("-l") { println!("cargo:rustc-link-lib={lib}"); }
+                else if let Some(dir)=flag.strip_prefix("-L") { println!("cargo:rustc-link-search=native={dir}"); }
+            }
+            println!("cargo:rustc-link-lib=rga");
+        }
         if std::env::var_os("CARGO_FEATURE_KMS").is_some() {
             println!("cargo:rerun-if-changed=c_engine/kms_engine.c");
             let output=std::process::Command::new("pkg-config").args(["--cflags","libdrm"]).output().expect("KMS requires pkg-config and libdrm development headers");

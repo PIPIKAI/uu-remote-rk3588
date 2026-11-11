@@ -15,7 +15,8 @@ struct uu_portal *uu_portal_open_virtual(const char *restore, void (*save_token)
 struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *), void *data, int *error, uint32_t *width, uint32_t *height);
 /* The cancellation callback and data are used only until this call returns. */
 struct uu_portal *uu_portal_open_persist_cancellable(const char *restore, void (*save_token)(const char *, void *), void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int *error, uint32_t *width, uint32_t *height);
-/* Select the capture transport before connecting, including on same-process recovery. */
+/* Select transport before connecting, including recovery: 0=SHM, 1=linear DMA,
+ * 2=linear or ARM 16x16 tiled DMA (consumer must normalize through EGL). */
 struct uu_portal *uu_portal_open_persist_capture(const char *restore, void (*save_token)(const char *, void *), void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height);
 struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32_t *width, uint32_t *height);
 /* Cursor mode for subsequent sessions: 1 hidden, 2 embedded (the compositor draws the pointer

@@ -74,7 +74,7 @@ struct uu_portal {
     uint64_t sequence;
     uint64_t revision;
     uint32_t buffers_seen, last_buffer_type;
-    int dma_requested, dma_negotiated, dma_format, dma_bad, dma_blocked, dma_neutral, dma_seen;
+    int dma_tiled, dma_requested, dma_negotiated, dma_format, dma_bad, dma_blocked, dma_neutral, dma_seen;
     uint64_t modifier;
     gint64 dma_requested_at;
     struct pw_buffer *dma_pending, *dma_current;
@@ -309,7 +309,7 @@ static void return_dma_buffer(struct uu_portal *p, struct pw_buffer **buffer) {
 }
 static int describe_dma_buffer(struct uu_portal *p, struct spa_buffer *spa, UuDmaFrame *frame) {
     if (p->error || atomic_load(&p->closed)) return 10;
-    if (p->modifier != 0) return 19;
+    if (p->modifier != 0 && !(p->dma_tiled && p->modifier == UINT64_C(0x0810000000000001))) return 19;
     if (!p->format_valid || !p->width || !p->height || spa->n_datas != 1) return 14;
     struct spa_data *d = &spa->datas[0];
     struct spa_meta_header *header = spa_buffer_find_meta_data(spa, SPA_META_Header, sizeof(*header));
@@ -319,7 +319,7 @@ static int describe_dma_buffer(struct uu_portal *p, struct spa_buffer *spa, UuDm
     struct spa_meta_region *crop = spa_buffer_find_meta_data(spa, SPA_META_VideoCrop, sizeof(*crop));
     if (crop && spa_meta_region_is_valid(crop) && (crop->region.position.x || crop->region.position.y ||
         crop->region.size.width != p->width || crop->region.size.height != p->height)) return 14;
-    /* Explicit sync is not advertised; require implicit DMA-BUF fences understood by VAAPI. */
+    /* Explicit sync is not advertised; require implicit DMA-BUF fences understood by the consumer. */
 #if PW_CHECK_VERSION(1, 2, 0)
     if (spa_buffer_find_meta(spa, SPA_META_SyncTimeline)) return 18;
 #endif
@@ -327,7 +327,11 @@ static int describe_dma_buffer(struct uu_portal *p, struct spa_buffer *spa, UuDm
         return 14;
     uint64_t offset = (uint64_t)d->mapoffset + d->chunk->offset;
     uint64_t size = (uint64_t)d->mapoffset + d->maxsize;
-    uint64_t required = offset + (uint64_t)(p->height - 1) * d->chunk->stride + (uint64_t)p->width * 4;
+    uint64_t required;
+    if (p->modifier) {
+        if (d->chunk->stride % 64) return 14;
+        required = offset + (uint64_t)((p->height + 15) & ~15u) * d->chunk->stride;
+    } else required = offset + (uint64_t)(p->height - 1) * d->chunk->stride + (uint64_t)p->width * 4;
     if (required > size || size > UINT32_MAX) return 14;
     if (required - offset > d->chunk->size) return 10;
     uint32_t fourcc;
@@ -425,7 +429,8 @@ static const struct pw_stream_events stream_events = {
 
 static unsigned capture_formats(struct uu_portal *p, struct spa_pod_builder *b, const struct spa_pod **params, int dma) {
     unsigned count = 0;
-    /* Only advertise linear RGB: arbitrary tiling/compression cannot be inferred from an FD.
+    /* Linear RGB is preferred. MPP can also import ARM tiled RGB through EGL;
+     * do not offer tiled buffers to consumers which only support linear input.
      * PipeWire page_dma_buf: put the modifier format before the shared-memory fallback. */
     for (int with_modifier = dma; with_modifier >= 0; with_modifier--) {
         struct spa_pod_frame frame;
@@ -443,7 +448,14 @@ static unsigned capture_formats(struct uu_portal *p, struct spa_pod_builder *b, 
             SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(60,1), &SPA_FRACTION(0,1), &SPA_FRACTION(60,1)), 0);
         if (with_modifier) {
             spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
-            spa_pod_builder_long(b, 0); /* DRM_FORMAT_MOD_LINEAR */
+            if (p->dma_tiled) {
+                struct spa_pod_frame modifiers;
+                spa_pod_builder_push_choice(b, &modifiers, SPA_CHOICE_Enum, 0);
+                spa_pod_builder_long(b, 0); /* default and supported alternatives */
+                spa_pod_builder_long(b, 0);
+                spa_pod_builder_long(b, UINT64_C(0x0810000000000001)); /* ARM 16x16 U-interleaved */
+                spa_pod_builder_pop(b, &modifiers);
+            } else spa_pod_builder_long(b, 0); /* DRM_FORMAT_MOD_LINEAR */
         }
         params[count++] = spa_pod_builder_pop(b, &frame);
     }
@@ -493,7 +505,7 @@ int uu_portal_dmabuf_acquire(struct uu_portal *p, UuDmaFrame *frame, uint64_t *r
         }
     }
     pthread_mutex_unlock(&p->lock);
-    /* A lease pins both the pw_buffer and its format across VAAPI's completion fence.
+    /* A lease pins both the pw_buffer and its format through the consumer's GPU completion.
      * No producer buffer may be returned, removed or renegotiated while the GPU reads it. */
     if (result != 0 && result != 12) pw_thread_loop_unlock(p->pw_loop);
     return result;
@@ -623,6 +635,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     p->cancelled = cancelled;
     p->cancel_data = cancel_data;
     p->dma_requested = !!prefer_dmabuf;
+    p->dma_tiled = prefer_dmabuf == 2;
     /* GNOME forwards NotifyPointerMotionAbsolute into Mutter's stream-to-stage
      * transform. It expects stream pixels, unlike the compositor-sized KDE path.
      * Do not apply the compositor scale twice on fractional-scale displays. */

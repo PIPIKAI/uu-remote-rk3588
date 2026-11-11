@@ -115,7 +115,7 @@ pub async fn run() -> Result<(), String> {
     let resolved = crate::capture_setting::pick_codec(true, true, crate::video_select::codec_force(selection.codec_pref), crate::video_select::hardware(selection.encoder));
     line("resolved codec", format!("{resolved:?}"));
     match crate::video::ffmpeg_encoders().await {
-        Some(found) => line("ffmpeg encoders", if found.is_empty() { "none of libx264/libx265/nvenc/vaapi".to_owned() } else { found.join(", ") }),
+        Some(found) => line("ffmpeg encoders", if found.is_empty() { "none of libx264/libx265/nvenc/vaapi/rkmpp".to_owned() } else { found.join(", ") }),
         None => line("ffmpeg encoders", "ffmpeg not runnable (install ffmpeg or set ffmpeg_root)"),
     }
     let mut version = crate::video::ffmpeg_command();

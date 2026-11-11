@@ -43,6 +43,8 @@ mod hevc;
 mod damage_capture;
 #[cfg(feature = "inproc-av")]
 mod inproc_encoder;
+#[cfg(all(target_os="linux", feature="native-rkmpp"))]
+mod rkmpp;
 mod capture_setting;
 mod audio;
 mod microphone;
@@ -206,7 +208,7 @@ pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
     if value.is_empty() { return false; }
     let value = value.to_ascii_lowercase();
     match which {
-        "set-encoder" => matches!(value.as_str(), "auto" | "cpu" | "vaapi" | "nvenc"),
+        "set-encoder" => matches!(value.as_str(), "auto" | "cpu" | "vaapi" | "nvenc" | "rkmpp"),
         "set-codec" => matches!(value.as_str(), "auto" | "h264" | "h265" | "hevc"),
         _ => false,
     }

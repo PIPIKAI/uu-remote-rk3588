@@ -376,13 +376,36 @@ systemctl --user restart uuremote-native.service
 
 开启后主机还会经 TCP/TLS 连接云端 TURN 中继（使用 `HTTPS_PROXY`/`ALL_PROXY` 里的无认证 `http://` 代理做 CONNECT，没有代理则直连），适用于 UDP 到不了 TURN 服务器、只有 TCP/代理能出网的主机；TURN 证书按 CA 链校验，云端下发的 TURN 地址是 IP 时容忍名称不匹配（媒体本身由 DTLS-SRTP 端到端加密）。默认（不开代理）只用 UDP 中继，行为不变。**这不创建任何新的网络出口**：登录、信令和媒体仍需各自有允许使用的网络路径。连接器只返回固定错误类别/HTTP 状态；不要为诊断开启会记录 URL/认证信息的依赖库 TRACE 日志。
 
-「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto（有 NVIDIA 时 NVENC 优先，失败再 CPU；没有 NVIDIA 时就是 CPU，不探测；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。成功结果缓存到进程退出，但 NVIDIA 是否存在（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）与报告不一致时，下一次桌面连接会在后台再探测一次（`warm_auto_probe`），这一路仍用缓存的编码器，直到新结果写入。NVENC 失败只缓存 10 分钟，到期后的桌面连接同样在后台再探测一次，这一路仍用当前结果。`set-encoder` 和 `set-codec` 写完后若 `host.pid` 指向正在运行的本程序，都会发 `SIGUSR2`：编码器变化时进行中的桌面流立刻换编码器（不断开，沿用本会话已协商的 codec；新编码器起不来时按进程内 → FFmpeg 进程 → CPU 回退）。手改文件后可 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。`SIGUSR2` 不重新探测。codec 偏好仍在下次建立桌面连接时生效（运行中的 host 只记日志，不重开编码）。显式 `vaapi` 请求真彩时仍用 VAAPI、编码 4:2:0，并在 CaptureSettingSync 的 field 3 回报 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。VAAPI 进入 auto 要等 #33。
+「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`/`rkmpp`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto（有 NVIDIA 时 NVENC 优先，失败再 CPU；没有 NVIDIA 时就是 CPU，不探测；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。成功结果缓存到进程退出，但 NVIDIA 是否存在（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）与报告不一致时，下一次桌面连接会在后台再探测一次（`warm_auto_probe`），这一路仍用缓存的编码器，直到新结果写入。NVENC 失败只缓存 10 分钟，到期后的桌面连接同样在后台再探测一次，这一路仍用当前结果。`set-encoder` 和 `set-codec` 写完后若 `host.pid` 指向正在运行的本程序，都会发 `SIGUSR2`：编码器变化时进行中的桌面流立刻换编码器（不断开，沿用本会话已协商的 codec；新编码器起不来时按进程内 → FFmpeg 进程 → CPU 回退）。手改文件后可 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。`SIGUSR2` 不重新探测。codec 偏好仍在下次建立桌面连接时生效（运行中的 host 只记日志，不重开编码）。显式 `vaapi` 请求真彩时仍用 VAAPI、编码 4:2:0，并在 CaptureSettingSync 的 field 3 回报 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。VAAPI 进入 auto 要等 #33。
 
 自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 
 选择码率档（原画 / 超清 / 高清 / 自定义）时，外部 FFmpeg 的 CPU 编码以平均码率（ABR）为目标，避免 4K 低码率下关键帧发灰；「自动」档仍使用恒定质量（CRF）。
 
 本地编码诊断 `desktop-video-probe [output.h264]` 可设置 `UU_PROBE_FPS`、`UU_PROBE_FRAMES`（默认 5）和 `UU_PROBE_QUALITY`（1–5）；设置 `UU_PROBE_INPUT=clip.y4m`（也支持 `.mp4`、`frames/%05d.png`）可绕过桌面采集，以相同的生产 FFmpeg 编码参数测量固定输入并打印分辨率和编码统计，`UU_PROBE_LOOP=1` 循环到指定帧数，输入无法打开或帧数不足时以非零状态退出（固定输入始终使用外部 FFmpeg 管线）。
+
+### RK3588 / Rockchip MPP 更新
+
+- 新增显式选择的 `rkmpp` 编码器，支持 H.264/H.265、4:2:0、画质/码率和帧率设置，以及 PLI/FIR 关键帧请求。
+- 新增默认关闭的 `native-rkmpp` 构建特性：Portal 视频直接调用 MPP，不启动视频 FFmpeg 进程；RGA 在硬件中处理缩放和对齐。
+- 优化原始像素传输：线性 DMA-BUF 直接导入；GNOME/Mali 的 ARM 16×16 分块 DMA-BUF 经 EGL/GPU 转成 MPP 线性缓冲区，避免 CPU 拷贝整帧像素。GPU 仍有布局转换，压缩码流仍经 CPU 内存发送。
+- 保留原有 auto、CPU、NVENC、VAAPI 选择规则和音频、输入、剪贴板、文件传输等逻辑；只有显式选择 `rkmpp` 才启用新增路径。DMA-BUF 不兼容时回退原生拷贝；原生编码失败再尝试 FFmpeg 硬编、CPU 编码。
+
+原生构建需要 Rockchip MPP 开发文件，以及 `librga-dev libegl-dev libgles-dev libgbm-dev libdrm-dev`（具体包名以发行版为准）：
+
+```sh
+cargo build --release --features wayland,portal,native-rkmpp
+uuremote-server set-encoder rkmpp
+```
+
+也可用 `UU_VIDEO_ENCODER=rkmpp`（已保存的非 auto 设置优先）。默认构建及其他采集后端通过 FFmpeg 的
+`h264_rkmpp` / `hevc_rkmpp` 使用 MPP，要求所选 FFmpeg 包含对应编码器；`ffmpeg_root` / `UU_FFMPEG_ROOT` 指向的 FFmpeg 同样如此。
+FFmpeg 路径直接使用 BGRA/BGR0，减少软件 RGB→NV12 转换；缩放仍在软件中完成。
+
+`UU_PORTAL_DMABUF=0` 禁用 DMA-BUF、恢复原生拷贝；`UU_RKMPP_DRM_DEVICE` 指定 EGL render 节点（默认 `/dev/dri/renderD128`）；
+`UU_VIDEO_PIPELINE=process` 改用 FFmpeg；`UU_RKMPP_RGB=0` 同时恢复 FFmpeg 的 NV12 软件转换。
+当前 DMA-BUF 路径要求单平面 RGB、零偏移及隐式同步，支持线性与 ARM 16×16 分块布局；AFBC、显式同步等不兼容布局会回退。
+音频与软件回退仍需要 FFmpeg，请保留安装。
 
 ## 让 AI 帮你安装或开发
 

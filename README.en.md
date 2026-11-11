@@ -415,7 +415,7 @@ With it the host also reaches the cloud TURN relays over TCP/TLS (CONNECT throug
 
 Host settings such as "lock after remote session" and "mute host" are stored in
 `~/.config/uuremote/host_settings.json`. The same file stores `video_encoder`
-(`auto`/`cpu`/`vaapi`/`nvenc`) and `video_codec` (`auto`/`h264`/`h265`), written by
+(`auto`/`cpu`/`vaapi`/`nvenc`/`rkmpp`) and `video_codec` (`auto`/`h264`/`h265`), written by
 `uuremote-server set-encoder` and `uuremote-server set-codec` (illegal arguments exit 2).
 A value other than `auto` beats `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`; `auto` or a missing
 field falls through to the environment, then to auto (NVENC then CPU when an NVIDIA driver
@@ -439,6 +439,30 @@ until #33.
 Custom bitrate follows the Mbps value selected in the client; for example, 1 Mbps sets an encoder cap of 1000 kbit/s.
 
 With external FFmpeg CPU encoding, the bitrate presets (Original / Ultra / HD / custom) use average bitrate (ABR) to avoid gray keyframes at 4K and low bitrates; Auto keeps constant rate factor (CRF).
+
+### RK3588 / Rockchip MPP updates
+
+- Added the explicitly selected `rkmpp` encoder: H.264/HEVC, 4:2:0, quality/bitrate and frame-rate settings, and PLI/FIR keyframe requests.
+- Added the opt-in `native-rkmpp` build feature: Portal video calls MPP directly without a video FFmpeg process; RGA handles scaling and alignment in hardware.
+- Reduced raw pixel copies: linear DMA-BUFs are imported directly; EGL/GPU converts GNOME/Mali ARM 16x16 tiled DMA-BUFs into linear MPP buffers without full-frame CPU pixel copies. GPU layout conversion and CPU copies of compressed packets remain.
+- Kept the existing auto, CPU, NVENC and VAAPI selection rules and audio, input, clipboard and file-transfer logic. The new path requires explicit `rkmpp` selection. Unsupported DMA-BUFs fall back to native host copies; native encoding failure falls back to FFmpeg hardware encoding, then CPU encoding.
+
+Native builds require Rockchip MPP development files and `librga-dev libegl-dev libgles-dev libgbm-dev libdrm-dev` (package names depend on the distribution):
+
+```sh
+cargo build --release --features wayland,portal,native-rkmpp
+uuremote-server set-encoder rkmpp
+```
+
+Alternatively, set `UU_VIDEO_ENCODER=rkmpp` (a saved non-auto encoder setting takes precedence).
+Default builds and other capture backends use FFmpeg's `h264_rkmpp` / `hevc_rkmpp`, so the selected FFmpeg must provide those encoders,
+including when selected through `ffmpeg_root` / `UU_FFMPEG_ROOT`.
+The FFmpeg path accepts BGRA/BGR0 directly to avoid software RGB-to-NV12 conversion; scaling still uses software.
+
+`UU_PORTAL_DMABUF=0` restores native host copies; `UU_RKMPP_DRM_DEVICE` selects the EGL render node (default `/dev/dri/renderD128`);
+`UU_VIDEO_PIPELINE=process` uses FFmpeg; `UU_RKMPP_RGB=0` also restores FFmpeg's software NV12 conversion.
+DMA-BUF input currently requires single-plane RGB, offset zero and implicit synchronization, with linear or ARM 16x16 tiled layouts.
+AFBC, explicit synchronization and other unsupported layouts fall back. FFmpeg is still required for audio and software fallback.
 
 ## Let an AI agent install or develop it
 

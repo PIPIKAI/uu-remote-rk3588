@@ -199,10 +199,11 @@ impl CompleteFrame {
 const RTP_CLOCK: u64 = 90_000;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(crate) enum Encoder { Cpu, Nvenc, Vaapi }
+pub(crate) enum Encoder { Cpu, Nvenc, Vaapi, Rkmpp }
 impl Encoder {
     pub(crate) fn name_for(self, codec: VideoCodec) -> &'static str {
         match (self, codec) {
+            (Self::Rkmpp, VideoCodec::H264) => "h264_rkmpp", (Self::Rkmpp, VideoCodec::H265) => "hevc_rkmpp",
             (Self::Cpu, VideoCodec::H264) => "libx264", (Self::Cpu, VideoCodec::H265) => "libx265",
             (Self::Nvenc, VideoCodec::H264) => "h264_nvenc", (Self::Nvenc, VideoCodec::H265) => "hevc_nvenc",
             (Self::Vaapi, VideoCodec::H264) => "h264_vaapi", (Self::Vaapi, VideoCodec::H265) => "hevc_vaapi",
@@ -212,12 +213,13 @@ impl Encoder {
 pub(crate) fn nvidia_present() -> bool {
     std::path::Path::new("/proc/driver/nvidia/version").exists() || std::path::Path::new("/dev/nvidia0").exists()
 }
-/// 真彩 (4:4:4): NVENC (in-process or FFmpeg) and libx264; h264_vaapi is 4:2:0 only.
+/// 真彩 (4:4:4): NVENC (in-process or FFmpeg) and libx264; VAAPI/RKMPP use 4:2:0.
 /// A GPU without 4:4:4 NVENC falls back to libx264, which keeps 4:4:4.
-pub(crate) fn full_chroma_for(encoder: Encoder) -> bool { encoder != Encoder::Vaapi }
+pub(crate) fn full_chroma_for(encoder: Encoder) -> bool { !matches!(encoder, Encoder::Vaapi | Encoder::Rkmpp) }
 
 /// (-profile:v, -pix_fmt) for NVENC / libx264 / libx265: 4:4:4 (真彩) needs a 4:4:4 profile.
 fn chroma_args(settings: &VideoSettings, encoder: Encoder) -> (&'static str, &'static str) {
+    if encoder == Encoder::Rkmpp { return (profile_for(settings.codec, false), "nv12"); }
     if settings.chroma != crate::capture_setting::CHROMA_444 { return (profile_for(settings.codec, false), "yuv420p"); }
     match (settings.codec, encoder) {
         (VideoCodec::H264, Encoder::Nvenc) => ("high444p", "yuv444p"),
@@ -276,8 +278,13 @@ fn cpu_hevc_options(settings: &VideoSettings, gop: &str) -> Vec<String> {
 /// compared on the 3090), so 4:2:0 without scaling skips the CPU BGRA→YUV pass (#16: ~2 cores at 4K).
 /// When the desktop is composited on the NVIDIA card itself, the packed-RGB path is slower than CPU
 /// conversion (#16: RTX 5070 at 4K, 82.6 vs 98 fps), so it stays off unless `UU_NVENC_RGB=1`.
-/// `input` is the source pixel format; `UU_NVENC_RGB=0` always restores CPU conversion.
-fn nvenc_rgb_input(settings: &VideoSettings, encoder: Encoder, input: &'static str) -> Option<&'static str> {
+/// RKMPP also accepts packed RGB; `UU_RKMPP_RGB=0` restores its NV12 conversion.
+/// `input` is the source pixel format; `UU_NVENC_RGB=0` restores NVENC CPU conversion.
+fn encoder_rgb_input(settings: &VideoSettings, encoder: Encoder, input: &'static str) -> Option<&'static str> {
+    // Rockchip accepts packed RGB directly, avoiding the CPU BGRA -> NV12 pass.
+    if encoder == Encoder::Rkmpp {
+        return (std::env::var("UU_RKMPP_RGB").as_deref() != Ok("0")).then_some(input);
+    }
     let wanted = match std::env::var("UU_NVENC_RGB").as_deref() {
         Ok("0") => false,
         Ok("1") => true,
@@ -300,6 +307,21 @@ fn nvidia_drives_display(drm: &std::path::Path) -> bool {
 }
 
 fn encoder_options(settings: &VideoSettings, encoder: Encoder, gop: &str, rgb: Option<&'static str>) -> Vec<String> {
+    if encoder == Encoder::Rkmpp {
+        // RKMPP uses NV12/VBR with parameter sets repeated at each IDR.
+        // FFmpeg's RKMPP wrapper owns MPP buffers and repeats parameter sets at IDRs.
+        // The H.264 reader requires an AUD per access unit; MPP does not emit these.
+        let target = settings.max_kbps().unwrap_or(30_000);
+        let mut options: Vec<String> = ["-c:v", encoder.name_for(settings.codec),
+            "-profile:v", profile_for(settings.codec, false), "-pix_fmt", rgb.unwrap_or("nv12"),
+            "-rc_mode", "VBR", "-b:v", &format!("{}k", target * 3 / 4),
+            "-maxrate", &format!("{target}k"), "-g", gop, "-bf", "0"]
+            .into_iter().map(str::to_owned).collect();
+        if settings.codec == VideoCodec::H264 {
+            options.extend(["-bsf:v".into(), "h264_metadata=aud=insert".into()]);
+        }
+        return options;
+    }
     let (maxrate, bufsize) = rate_args(settings, encoder);
     let cq = settings.cq().to_string();
     let target = settings.max_kbps().map_or("16M".to_string(), |k| format!("{}k", k * 3 / 4));
@@ -381,7 +403,7 @@ pub async fn ffmpeg_encoders() -> Option<Vec<&'static str>> {
     ffmpeg.args(["-hide_banner", "-encoders"]).kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(5), ffmpeg.output()).await.ok()?.ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
-    Some(["libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi"].into_iter()
+    Some(["libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi", "h264_rkmpp", "hevc_rkmpp"].into_iter()
         .filter(|name| text.split_whitespace().any(|word| word == *name)).collect())
 }
 
@@ -391,7 +413,7 @@ pub async fn ffmpeg_encoders() -> Option<Vec<&'static str>> {
 /// Installing FFmpeg clears the window line on the next check; no restart is needed.
 pub fn check_ffmpeg_usable() {
     if crate::desktop_backend::headless() { return; }
-    #[cfg(feature = "inproc-av")]
+    #[cfg(any(feature = "inproc-av",all(target_os="linux",feature="native-rkmpp")))]
     if native_engine_eligible(crate::video_select::selection().encoder, NativeDisplayKind::Portal)
         && native_display_kind() == NativeDisplayKind::Portal { return; }
     tokio::spawn(async {
@@ -612,6 +634,11 @@ pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
 }
 
 pub async fn hevc_available(requested: Encoder) -> bool {
+    #[cfg(all(target_os="linux",feature="native-rkmpp"))]
+    if requested==Encoder::Rkmpp && native_engine_eligible(requested,native_display_kind()) {
+        return tokio::task::spawn_blocking(|| crate::rkmpp::black_frame(VideoCodec::H265)
+            .is_ok_and(|frame|is_independent_frame_for(&frame,VideoCodec::H265))).await.unwrap_or(false);
+    }
     let spec = ffmpeg_spec();
     let cell = hevc_cell(hevc_cache(), &spec, requested);
     *cell.get_or_init(|| probe_hevc(spec, requested)).await
@@ -692,9 +719,9 @@ impl EncoderTask {
     }
 }
 
-#[cfg(feature = "inproc-av")]
+#[cfg(any(feature = "inproc-av", all(target_os="linux",feature="native-rkmpp")))]
 struct StopOnDrop(Arc<AtomicBool>);
-#[cfg(feature = "inproc-av")]
+#[cfg(any(feature = "inproc-av", all(target_os="linux",feature="native-rkmpp")))]
 impl Drop for StopOnDrop { fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Relaxed); } }
 
 async fn read_encoder(
@@ -713,10 +740,10 @@ async fn read_encoder(
         log::info!("Chroma 4:4:4 requested; encoder={} source={} encodes 4:2:0", format!("{encoder:?}").to_ascii_lowercase(), crate::video_select::encoder_source_label(selection.encoder_source));
     }
     if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await; }
-    #[cfg_attr(not(feature = "inproc-av"), allow(unused_mut))]
+    #[cfg_attr(not(any(feature = "inproc-av", feature="native-rkmpp")), allow(unused_mut))]
     let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,true,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
     // A failed native session still leaves the matching FFmpeg hardware pipeline.
-    #[cfg(feature = "inproc-av")]
+    #[cfg(any(feature = "inproc-av", all(target_os="linux", feature="native-rkmpp")))]
     if let Err(error) = &result {
         if !latest.is_closed() && native_inproc(&display, portal.is_some(), encoder) && x11_resized(&display, portal.is_some(), size).is_none() {
             log::warn!("In-process {} stream unavailable; switching to the FFmpeg process pipeline: {}",encoder.name_for(settings.codec),error);
@@ -745,6 +772,8 @@ fn x11_resized(display: &str, portal: bool, size: (u32, u32)) -> Option<(u32, u3
 pub(crate) enum NativeDisplayKind { X11, Wayland, Portal, Kms, None }
 
 pub(crate) fn native_engine_eligible(encoder: Encoder, kind: NativeDisplayKind) -> bool {
+    #[cfg(all(target_os="linux",feature="native-rkmpp"))]
+    if encoder==Encoder::Rkmpp {return kind==NativeDisplayKind::Portal && crate::rkmpp::selected();}
     #[cfg(feature = "inproc-av")]
     { (kind == NativeDisplayKind::X11 || (kind == NativeDisplayKind::Portal && encoder == Encoder::Vaapi))
         && crate::inproc_encoder::selected(encoder) }
@@ -752,13 +781,13 @@ pub(crate) fn native_engine_eligible(encoder: Encoder, kind: NativeDisplayKind) 
     { let _ = (encoder, kind); false }
 }
 
-/// NVENC serves X11; VAAPI also accepts frames from the existing Portal session.
-#[cfg(feature = "inproc-av")]
+/// NVENC serves X11; VAAPI and optional RKMPP also accept Portal frames.
+#[cfg(any(feature="inproc-av",all(target_os="linux",feature="native-rkmpp")))]
 fn native_inproc(display: &str, portal: bool, encoder: Encoder) -> bool {
     native_engine_eligible(encoder, display_kind(display, portal))
 }
 
-#[cfg(feature = "inproc-av")]
+#[cfg(any(feature="inproc-av",all(target_os="linux",feature="native-rkmpp")))]
 fn display_kind(display: &str, portal: bool) -> NativeDisplayKind {
     if portal { NativeDisplayKind::Portal }
     else if display.starts_with("wayland:") { NativeDisplayKind::Wayland }
@@ -795,6 +824,33 @@ async fn read_inprocess(
     job.await.map_err(|e| format!("Encoder task: {e}"))?
 }
 
+#[cfg(all(target_os="linux",feature="native-rkmpp"))]
+async fn read_rkmpp(portal:Arc<crate::portal::PortalSession>,latest:mpsc::Sender<Arc<CompleteFrame>>,
+    sequence:Arc<std::sync::atomic::AtomicU64>,idr:Arc<AtomicBool>,budget:Arc<Semaphore>,
+    settings:VideoSettings,selection:crate::video_select::Selection)->Result<(),String> {
+    let input=portal.size();let output=settings.output.unwrap_or(input);
+    let config=crate::rkmpp::Config {input,output:((output.0+1)&!1,(output.1+1)&!1),fps:u32::from(settings.fps),
+        gop:gop_frames(settings.fps,true) as u32,max_bps:settings.max_kbps().unwrap_or(30_000)*1000,codec:settings.codec};
+    log::info!("Desktop encoder: source={}x{} output={:?} fps={} encoder={} source={} pix_fmt=bgra pipeline=native-mpp",
+        input.0,input.1,config.output,config.fps,Encoder::Rkmpp.name_for(settings.codec),
+        crate::video_select::encoder_source_label(selection.encoder_source));
+    let (tx,mut rx)=mpsc::channel::<crate::rkmpp::Unit>(4);
+    let stop=Arc::new(AtomicBool::new(false));let _guard=StopOnDrop(stop.clone());
+    let slot=crate::rkmpp::stream_slot(&idr).await;
+    let job=tokio::task::spawn_blocking({let stop=stop.clone();move || {
+        let _slot=slot;crate::rkmpp::run(config,portal,tx,stop,idr,budget)
+    }});
+    let mut gate=DependencyGate::default();
+    while let Some(unit)=rx.recv().await {
+        let sequence=sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed)+1;
+        gate.submit(&latest,Arc::new(CompleteFrame {source_id:settings.source_id,source_generation:settings.source_generation,
+            codec:settings.codec,sequence,completed_at:unit.completed_at,data:unit.data.into(),_permit:Some(unit.permit)}));
+        if latest.is_closed() {break;}
+    }
+    stop.store(true,std::sync::atomic::Ordering::Relaxed);drop(rx);
+    job.await.map_err(|e|format!("Native MPP worker: {e}"))?
+}
+
 /// VBV buffer in kbit. libx264 and NVENC need room for a whole IDR frame, otherwise large desktops get
 /// keyframes quantized into a blur that sharpens over the GOP (#8 libx264, #103 NVENC). Half a second of
 /// bitrate still starved repeated 0.5 s-GOP keyframes at 3296x2036/2M; one second did not. The 8000 kbit
@@ -804,6 +860,7 @@ fn buffer_kbits(max_kbps: u32, encoder: Encoder) -> u32 {
     let env = match encoder {
         Encoder::Cpu => return max_kbps.clamp(500, 8000),
         Encoder::Vaapi => "UU_VAAPI_BUFFER_MS",
+        Encoder::Rkmpp => return (max_kbps / 8).clamp(100, 500),
         Encoder::Nvenc => "UU_NVENC_BUFFER_MS",
     };
     let requested = std::env::var(env).ok();
@@ -835,13 +892,19 @@ fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
 
 async fn read_encoder_with(
     size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,encoder:Encoder,
-    #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] allow_inproc: bool,sequence:Arc<std::sync::atomic::AtomicU64>,
-    settings: VideoSettings, #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+    #[cfg_attr(not(any(feature = "inproc-av", feature="native-rkmpp")), allow(unused_variables))] allow_inproc: bool,sequence:Arc<std::sync::atomic::AtomicU64>,
+    settings: VideoSettings, #[cfg_attr(not(any(feature = "inproc-av", feature="native-rkmpp")), allow(unused_variables))] idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
     selection: crate::video_select::Selection,
 )->Result<(),String>{
     let selected_output=crate::wayland::capture_source(&display,portal.is_some(),settings.source_id);
     // Portal frames come from the session's current monitor, whatever the advertised mode says.
     let size=portal.as_ref().map(|p|p.size()).or(selected_output.map(|s|(s.width,s.height))).unwrap_or(size);
+    #[cfg(all(target_os="linux",feature="native-rkmpp"))]
+    if allow_inproc && encoder==Encoder::Rkmpp && crate::rkmpp::selected() {
+        if let Some(session)=portal.as_ref() {
+            return read_rkmpp(session.clone(),latest,sequence,idr,budget,settings,selection).await;
+        }
+    }
     let kms=display.starts_with("kms:");
     let wayland=kms || display.starts_with("wayland:");
     // X11 multi-screen: x11grab reads only the selected monitor's region of the root.
@@ -876,7 +939,7 @@ async fn read_encoder_with(
     let (maxrate, _) = rate_args(&settings, encoder);
     let cq = settings.cq().to_string();
     // x11grab delivers bgr0; the Wayland/portal/KMS pipe is bgra.
-    let rgb = nvenc_rgb_input(&settings, encoder, if wayland { "bgra" } else { "bgr0" });
+    let rgb = encoder_rgb_input(&settings, encoder, if wayland { "bgra" } else { "bgr0" });
     log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.fps,cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(selection.encoder_source),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
     // A bundled FFmpeg prefix (config ffmpeg_root / UU_FFMPEG_ROOT) or `ffmpeg` on PATH.
     let ffmpeg = ffmpeg_spec();
