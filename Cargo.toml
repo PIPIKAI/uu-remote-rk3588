@@ -73,6 +73,9 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 [build-dependencies]
 cc = "1.0"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+
 [patch.crates-io]
 # RTP rollover counter survives delayed NACK retransmissions (vendor/webrtc-srtp/PATCHES.md).
 webrtc-srtp = { path = "vendor/webrtc-srtp" }

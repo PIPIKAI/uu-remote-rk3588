@@ -61,6 +61,8 @@ mod system_metrics;
 mod clipboard;
 mod clipboard_protocol;
 mod clipboard_rich;
+mod clipboard_files;
+mod clipboard_fs;
 mod viewer_metrics;
 mod cursor;
 
@@ -412,7 +414,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // HTTP/WS dependency trace logging can expose Authorization or room headers.
         env_logger::Builder::new().filter_level(log::LevelFilter::Off)
             .filter_module("uuremote_server", log::LevelFilter::Info).init();
-    } else { env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init(); }
+    } else {
+        // FUSE framework diagnostics include clipboard paths.
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).filter_module("fuser",log::LevelFilter::Off).init();
+    }
     // An unknown argument must never fall through to starting a second full host server.
     let arg1 = std::env::args().nth(1);
     let value_ok = match arg1.as_deref() {
@@ -690,7 +695,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(target_os="linux"))]
         let _ = tokio::signal::ctrl_c().await;
-        if !assist_enabled { privacy_screen::shutdown(); shutdown_input.shutdown(); microphone::shutdown().await; virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
+        if !assist_enabled { clipboard_fs::shutdown(); privacy_screen::shutdown(); shutdown_input.shutdown(); microphone::shutdown().await; virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
         let _ = signal_tx.send(true);
     });
     let mut assist = if assist_enabled { Some(assist::Assist::start(&mut shutdown, unified).await?) } else { None };
@@ -721,7 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One exit path for commands, signals, transport failures and UI failures.
     if let Some(session) = assist.as_mut() { session.allowed = false; }
     for (_, old) in webrtc_sessions.lock().await.drain() { close_peer(&old.pc).await; }
-    privacy_screen::shutdown(); microphone::shutdown().await; virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
+    clipboard_fs::shutdown(); privacy_screen::shutdown(); microphone::shutdown().await; virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
     // Switching identity (signed in / out) restarts at once and the new identity republishes the same
     // device share: logout already withdrew it, and after a QR login the cloud moved it to the account
     // (a guest cancel then fails). Only a real stop withdraws here.

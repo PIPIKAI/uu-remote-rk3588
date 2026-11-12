@@ -48,34 +48,34 @@ pub fn format_ids(rpc:&[u8])->Vec<u64>{
     fields.iter().filter(|f|f.number==1).filter_map(|f|match f.value{WireValue::Bytes(format)=>number(format,1).ok(),_=>None}).take(32).collect()
 }
 
-fn int(field:u32,value:u64,out:&mut Vec<u8>){varint(u64::from(field)<<3,out);varint(value,out);}
+pub(crate) fn int(field:u32,value:u64,out:&mut Vec<u8>){varint(u64::from(field)<<3,out);varint(value,out);}
 fn string(field:u32,value:&str,out:&mut Vec<u8>){nested(field,value.as_bytes(),out);}
-fn number(data:&[u8],field:u32)->Result<u64,&'static str>{
+pub(crate) fn number(data:&[u8],field:u32)->Result<u64,&'static str>{
     let fields=decode_wire(data).map_err(|_|"invalid clipboard message")?;
     match fields.iter().find(|f|f.number==field).map(|f|&f.value){
         Some(WireValue::Varint(v))=>Ok(*v),None=>Ok(0),_=>Err("invalid clipboard integer"),
     }
 }
-fn bytes(data:&[u8],field:u32)->Result<Option<&[u8]>,&'static str>{
+pub(crate) fn bytes(data:&[u8],field:u32)->Result<Option<&[u8]>,&'static str>{
     let fields=decode_wire(data).map_err(|_|"invalid clipboard message")?;
     match fields.iter().find(|f|f.number==field).map(|f|&f.value){
         Some(WireValue::Bytes(v))=>Ok(Some(*v)),None=>Ok(None),_=>Err("invalid clipboard bytes"),
     }
 }
-fn text_field(data:&[u8],field:u32)->Result<&str,&'static str>{
+pub(crate) fn text_field(data:&[u8],field:u32)->Result<&str,&'static str>{
     std::str::from_utf8(bytes(data,field)?.unwrap_or(&[])).map_err(|_|"invalid clipboard string")
 }
-fn header(data:&[u8])->Result<&[u8],&'static str>{
+pub(crate) fn header(data:&[u8])->Result<&[u8],&'static str>{
     let h=bytes(data,1)?.ok_or("missing clipboard request header")?;
     if h.len()>32{return Err("clipboard header exceeds limit");}
     number(h,1)?;Ok(h)
 }
-fn request(id:u64,kind:u32,body:&[u8])->Vec<u8>{
+pub(crate) fn request(id:u64,kind:u32,body:&[u8])->Vec<u8>{
     let mut h=Vec::new();int(1,id,&mut h);
     let mut clip=Vec::new();nested(kind,body,&mut clip);
     let mut rpc=Vec::new();nested(1,&h,&mut rpc);nested(9,&clip,&mut rpc);rpc
 }
-fn response(h:&[u8],kind:u32,body:&[u8])->Vec<u8>{
+pub(crate) fn response(h:&[u8],kind:u32,body:&[u8])->Vec<u8>{
     let mut clip=Vec::new();nested(kind,body,&mut clip);
     let mut rpc=Vec::new();nested(1,h,&mut rpc);nested(5,&clip,&mut rpc);rpc
 }

@@ -48,7 +48,9 @@ mod native {
         fn uu_portal_clipboard_supported(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_ready(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_set(portal: *mut c_void, text: *const u8, length: usize) -> i32;
+        fn uu_portal_clipboard_set_file(portal: *mut c_void, uri: *const u8, length: usize) -> i32;
         fn uu_portal_clipboard_copy(from: *mut c_void, to: *mut c_void) -> i32;
+        fn uu_portal_clipboard_poll_files(portal: *mut c_void, uris: *mut u8, capacity: usize) -> i32;
         fn uu_portal_clipboard_poll(portal: *mut c_void, text: *mut u8, capacity: usize) -> i32;
         fn uu_portal_close(portal: *mut c_void);
         fn uu_portal_alive(portal: *mut c_void) -> i32;
@@ -733,11 +735,26 @@ mod native {
             let handle=self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
             if unsafe { uu_portal_clipboard_set(handle.0.as_ptr(),text.as_ptr(),text.len()) }==0 {Ok(())} else {Err("Portal clipboard ownership failed".into())}
         }
+        pub fn clipboard_set_files(&self, uri: &str) -> Result<(), String> {
+            if uri.len()>crate::clipboard::MAX_TEXT || *self.locked.borrow()!=Some(false) {return Err("Portal clipboard unavailable".into());}
+            let _write=self.clipboard_write.lock().map_err(|_|"Portal clipboard lock poisoned")?;
+            let handle=self.handle.lock().map_err(|_|"Portal session lock poisoned")?;
+            if unsafe {uu_portal_clipboard_set_file(handle.0.as_ptr(),uri.as_ptr(),uri.len())}==0 {Ok(())}
+            else {Err("Portal file clipboard ownership failed".into())}
+        }
         pub fn clipboard_poll(&self) -> Option<String> {
             if *self.locked.borrow()!=Some(false) { return None; }
             let handle=self.handle.lock().ok()?;
             let mut bytes=vec![0;crate::clipboard::MAX_TEXT];
             let length=unsafe { uu_portal_clipboard_poll(handle.0.as_ptr(),bytes.as_mut_ptr(),bytes.len()) };
+            if length<0 { return None; }
+            bytes.truncate(length as usize); String::from_utf8(bytes).ok()
+        }
+        pub fn clipboard_poll_files(&self) -> Option<String> {
+            if *self.locked.borrow()!=Some(false) { return None; }
+            let handle=self.handle.lock().ok()?;
+            let mut bytes=vec![0;crate::clipboard::MAX_TEXT];
+            let length=unsafe { uu_portal_clipboard_poll_files(handle.0.as_ptr(),bytes.as_mut_ptr(),bytes.len()) };
             if length<0 { return None; }
             bytes.truncate(length as usize); String::from_utf8(bytes).ok()
         }
@@ -1114,7 +1131,9 @@ impl PortalSession {
     pub fn clipboard_supported(&self) -> bool { false }
     pub fn clipboard_ready(&self) -> bool { false }
     pub fn clipboard_set(&self, _: &str) -> Result<(), String> { Err(error(15)) }
+    pub fn clipboard_set_files(&self, _: &str) -> Result<(), String> { Err(error(15)) }
     pub fn clipboard_poll(&self) -> Option<String> { None }
+    pub fn clipboard_poll_files(&self) -> Option<String> { None }
     pub fn is_alive(&self) -> bool { false }
     pub fn open() -> Result<Self, String> { Err("Portal backend requires Linux and --features portal".into()) }
     pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, PortalError> {

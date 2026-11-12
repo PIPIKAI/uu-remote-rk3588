@@ -497,11 +497,40 @@ impl WebRtcSession {
         let file_channel: Arc<std::sync::Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(std::sync::Mutex::new(None));
         let (file_tx, mut file_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let peer_files = crate::file_trans::FileSession::new(file_tx, control_sequence.clone());
+        let (clipboard_state,mut clipboard_reads)=crate::clipboard_files::State::new();
+        let clipboard_files = Arc::new(std::sync::Mutex::new(clipboard_state));
         // Mac 4.43: streamerDidReceiveTextData (0x1001f56b4, arm64) reaches
         // the metrics/RPC dispatcher at 0x1003a8560; CONTROL does not.
         // Keep CONTROL metrics for other viewers; privacy replies use TEXT.
         let (text_tx, text_rx) = text_outbox::channel();
         let text_rx = Arc::new(tokio::sync::Mutex::new(Some(OutboundReceiver::Text(text_rx))));
+        {
+            let state=clipboard_files.clone();let output=text_tx.clone();let sequence=control_sequence.clone();
+            let peer=Arc::downgrade(&pc);let role=role.clone();let locked=channel_lock_state.clone();
+            tokio::spawn(async move {
+                let mut tick=tokio::time::interval(std::time::Duration::from_millis(250));
+                loop {
+                    tokio::select! {
+                        read=clipboard_reads.recv()=>{
+                            let Some(read)=read else{break;};
+                            if !role.is_desktop() || *locked.borrow()!=Some(false) {read.reject();continue;}
+                            let payload=state.lock().unwrap().read(read,sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed));
+                            if let Some(payload)=payload {
+                                let ts=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                if output.send(crate::initialization::envelope(sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),ts,21,&payload)).is_err() {state.lock().unwrap().cancel();}
+                            }
+                        },
+                        _=tick.tick()=>{
+                            let closed=peer.upgrade().is_none_or(|p|matches!(p.connection_state(),webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed|webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed));
+                            let mut state=state.lock().unwrap();state.expire();
+                            if closed || !role.is_desktop() || *locked.borrow()!=Some(false) {state.cancel();}
+                            if closed {break;}
+                        },
+                    }
+                }
+            });
+        }
+
         // 端口映射 frames (Message 27) also travel on FILE_DATA_CHANNEL; one session per peer.
         let port_mapping = crate::port_mapping::Session::new(file_channel.clone(), control_sequence.clone());
         {
@@ -552,6 +581,7 @@ impl WebRtcSession {
             let echo_seen = echo_seen.clone();
             let channel_lock_state = channel_lock_state.clone();
             let peer_files = peer_files.clone();
+            let clipboard_files = clipboard_files.clone();
             let text_out = text_tx.clone();
             let text_rx = text_rx.clone();
             let peer_port_mapping = port_mapping.clone();
@@ -835,6 +865,7 @@ impl WebRtcSession {
                     let last_echo_request = last_echo_request.clone();
                     let echo_seen = echo_seen.clone();
                     let rich_outgoing=rich_state.clone();
+                    let open_clipboard_files=clipboard_files.clone();
                     let open_actions = channel_actions.clone();
                     let open_video = channel_video_settings.clone();
                     let open_track = peer_video_track.clone();
@@ -855,6 +886,7 @@ impl WebRtcSession {
                         let clipboard_sink = clipboard_sink.clone();
                         let clipboard_ready = clipboard_ready.clone();
                         let rich_outgoing=rich_outgoing.clone();
+                        let outgoing_files=open_clipboard_files.clone();
                         let portal_desktop = open_desktop.clone();
                         let owner = open_owner.clone();
                         let role = open_role.clone();
@@ -913,6 +945,25 @@ impl WebRtcSession {
                                       tokio::select! {
                                           _ = health.tick() => {
                                               if clipboard_channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { break; }
+                                              if std::env::var("UU_CLIPBOARD_FILES").as_deref()==Ok("1") {
+                                                  if let Some(portal)=screen.portal.clone() {
+                                                      let state=outgoing_files.clone();let seq=clipboard_sequence.clone();
+                                                      let offered=tokio::task::spawn_blocking(move|| {
+                                                          let uris=portal.clipboard_poll_files()?;
+                                                          let mut state=state.lock().unwrap();
+                                                          if uris.is_empty(){state.clear_local();return None;}
+                                                          Some(state.offer_local(seq.fetch_add(1,std::sync::atomic::Ordering::Relaxed),&uris))
+                                                      }).await;
+                                                      match offered {
+                                                          Ok(Some(Ok(payload)))=>{
+                                                              let ts=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                              if text_out.send(crate::initialization::envelope(clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),ts,21,&payload)).is_err(){break;}
+                                                          },
+                                                          Ok(Some(Err(reason)))=>log::warn!("Local clipboard file offer rejected: {}",reason),
+                                                          _=>{},
+                                                      }
+                                                  }
+                                              }
                                           },
                                           _ = async { let _ = active.wait_for(|active| !*active).await; } => break,
                                           changed = updates.changed() => {
@@ -920,6 +971,7 @@ impl WebRtcSession {
                                               let text = updates.borrow_and_update().clone();
                                               let Some(text) = text else { continue; };
                                               {
+                                                  {let mut files=outgoing_files.lock().unwrap();files.cancel();files.clear_local();}
                                                   let request_id=clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
                                                   let payload = match rich_outgoing.lock().unwrap().offer(request_id,text.clone()) {
                                                       Ok(payload)=>payload,Err(reason)=>{log::warn!("Clipboard offer rejected: {}",reason);continue;}
@@ -1184,6 +1236,7 @@ impl WebRtcSession {
                     let clipboard_assembly = clipboard_assembly.clone();
                     let clipboard_ready = clipboard_enabled.clone();
                     let rich_incoming=rich_state.clone();
+                    let clipboard_files = clipboard_files.clone();
                     let file_worker = file_session.clone();
                     let mapping = peer_port_mapping.clone();
                     let actions = channel_actions.clone();
@@ -1299,27 +1352,39 @@ impl WebRtcSession {
                                 }
                             }
                         }
-                        // Temporary bounded clipboard routing diagnostics: schema only,
-                        // never text values, payload bytes, key values or clipboard content.
-                        if channel_name == "TEXT_DATA_CHANNEL" || channel_name == "BINARY_DATA_CHANNEL" || channel_name == "FILE_DATA_CHANNEL" {
-                            static CLIPBOARD_SHAPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                            static TOOL_SHAPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                            let counter = if channel_name == "TEXT_DATA_CHANNEL" { &CLIPBOARD_SHAPES } else { &TOOL_SHAPES };
-                            if counter.fetch_add(1,std::sync::atomic::Ordering::Relaxed) < 40 {
-                                let shape = if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&msg.data) {
-                                    fn shape(v:&serde_json::Value,depth:usize)->serde_json::Value {
-                                        use serde_json::{Value,json};
-                                        match v {
-                                            Value::Object(o) if depth<2 => Value::Object(o.iter().take(24).filter(|(k,_)|k.len()<=48&&k.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')).map(|(k,v)|(k.clone(),shape(v,depth+1))).collect()),
-                                            Value::String(_)=>json!("string"), Value::Number(_)=>json!("number"), Value::Bool(_)=>json!("bool"),
-                                            Value::Array(_)=>json!("array"),Value::Object(_)=>json!("object"),Value::Null=>json!("null"),
+                        if std::env::var("UU_CLIPBOARD_FILES").as_deref()==Ok("1")
+                            && message_role.is_desktop() && screen.portal.is_some()
+                            && *lock_for_message.borrow()==Some(false) {
+                            if let Some(fields)=proto_fields.as_deref() {
+                                for field in fields {
+                                    if let (kind @ (21|22),crate::protocol::WireValue::Bytes(payload))=(field.number,&field.value) {
+                                        let state=clipboard_files.clone();let sequence=out_sequence.clone();let payload=payload.to_vec();
+                                        let result=tokio::task::spawn_blocking(move||{
+                                            let mut next=||sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                                            state.lock().unwrap().handle(kind,&payload,&mut next)
+                                        }).await.unwrap_or(Err("clipboard worker failed"));
+                                        match result {
+                                            Ok(Some(result))=>{
+                                                if result.clear {if let Some(portal)=screen.portal.clone(){let _=tokio::task::spawn_blocking(move||portal.clipboard_set("")).await;}}
+                                                for (kind,payload) in result.messages {
+                                                    let ts=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                    let _=text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),ts,kind,&payload));
+                                                }
+                                                if let (Some(file),Some(portal))=(result.offer,screen.portal.clone()) {
+                                                    if !matches!(tokio::task::spawn_blocking(move ||crate::clipboard_files::publish(file,&portal)).await,Ok(Ok(()))) {
+                                                        clipboard_files.lock().unwrap().cancel();log::warn!("Clipboard virtual file offer failed");
+                                                    }
+                                                }
+                                                return;
+                                            }
+                                            Err(reason)=>{
+                                                clipboard_files.lock().unwrap().cancel();
+                                                log::warn!("Clipboard file transfer rejected: {}",reason);return;
+                                            }
+                                            Ok(None)=>{},
                                         }
                                     }
-                                    shape(&value,0).to_string()
-                                } else if let Some(fields) = proto_fields.as_deref() {
-                                    format!("protobuf fields={:?}",fields.iter().map(|f|f.number).collect::<Vec<_>>())
-                                } else { "opaque".to_string() };
-                                log::info!("Clipboard channel schema: channel={} bytes={} schema={}",channel_name,msg.data.len(),shape);
+                                }
                             }
                         }
                         if channel_name == "CONTROL_DATA_CHANNEL" || channel_name == "TEXT_DATA_CHANNEL" {
@@ -1375,7 +1440,7 @@ impl WebRtcSession {
                                                     let _=reply_chan.send(&bytes::Bytes::from(message)).await;
                                                 }
                                             }
-                                            Ok(None)=> {if let Ok(nested)=crate::protocol::decode_wire(payload){log::info!("Clipboard RPC request schema: fields={:?}",nested.iter().map(|f|f.number).collect::<Vec<_>>());}},
+                                            Ok(None)=>{},
                                             Err(reason)=>log::warn!("Clipboard RPC rejected: {}",reason),
                                         }
                                     }

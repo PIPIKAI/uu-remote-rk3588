@@ -72,7 +72,16 @@ static void selection_owner(GDBusConnection *bus,const gchar *sender,const gchar
                 g_free(selected); selected=g_strdup(type); if (!strcmp(type,"text/plain;charset=utf-8")) break;
             }
         }
-        if (getenv("UU_CLIPBOARD_DIAGNOSTICS")) fprintf(stderr,"Portal clipboard owner: own=%d text=%d\n",owner,selected!=NULL);
+        /* File managers often also offer a text representation. Prefer actual file URIs. */
+        if (!owner && types && getenv("UU_CLIPBOARD_FILES") && !strcmp(getenv("UU_CLIPBOARD_FILES"),"1")) {
+            GVariantIter iter; const char *type; g_variant_iter_init(&iter,types);
+            while (g_variant_iter_next(&iter,"&s",&type)) {
+                if (!strcmp(type,"text/uri-list") || !strcmp(type,"x-special/gnome-copied-files")) {
+                    g_free(selected); selected=g_strdup(type);
+                    if (!strcmp(type,"x-special/gnome-copied-files")) break;
+                }
+            }
+        }
         pthread_mutex_lock(&p->lock);
         g_free(p->clipboard_mime); p->clipboard_mime=selected;
         p->clipboard_changed=!owner && selected!=NULL; p->clipboard_revision++;
@@ -90,8 +99,13 @@ static void selection_transfer(GDBusConnection *bus,const gchar *sender,const gc
     if (strcmp(session,p->session)) return;
     uint8_t *copy=NULL; size_t length=0;
     pthread_mutex_lock(&p->lock);
-    if (text_mime(mime) && p->clipboard_text) {
+    if (!p->clipboard_files && text_mime(mime) && p->clipboard_text) {
         length=p->clipboard_length; copy=g_memdup2(p->clipboard_text,length+1);
+    } else if (p->clipboard_files==1 && p->clipboard_text) {
+        if (!strcmp(mime,"text/uri-list")) {char **lines=g_strsplit(p->clipboard_text,"\n",-1);char *joined=g_strjoinv("\r\n",lines);copy=(uint8_t *)g_strconcat(joined,"\r\n",NULL);g_free(joined);g_strfreev(lines);}
+        /* Nautilus 46 rejects an empty last line in its copied-files format. */
+        if (!strcmp(mime,"x-special/gnome-copied-files")) copy=(uint8_t *)g_strconcat("copy\n",p->clipboard_text,NULL);
+        if (copy) length=strlen((char *)copy);
     }
     pthread_mutex_unlock(&p->lock);
     int success=0;
@@ -106,24 +120,26 @@ static void selection_transfer(GDBusConnection *bus,const gchar *sender,const gc
 }
 int uu_portal_clipboard_supported(struct uu_portal *p) { return p && p->clipboard_enabled; }
 int uu_portal_clipboard_ready(struct uu_portal *p) { return p && p->clipboard_enabled && uu_portal_alive(p); }
-int uu_portal_clipboard_set(struct uu_portal *p,const uint8_t *text,size_t length) {
+static int clipboard_set_selection(struct uu_portal *p,const uint8_t *text,size_t length,int files) {
     if (!uu_portal_clipboard_ready(p) || length>CLIP_LIMIT || !g_utf8_validate((const char *)text,(gssize)length,NULL)) return -1;
     char *copy=g_malloc(length+1); memcpy(copy,text,length); copy[length]=0;
     pthread_mutex_lock(&p->lock);
     /* Serve the new text while the portal announces it, and restore the old one on failure. */
     char *old_text=p->clipboard_text; size_t old_length=p->clipboard_length;
+    int old_files=p->clipboard_files;
     uint64_t revision=p->clipboard_revision;
-    p->clipboard_text=copy; p->clipboard_length=length; p->clipboard_changed=0;
+    p->clipboard_text=copy; p->clipboard_length=length; p->clipboard_changed=0; p->clipboard_files=files;
     pthread_mutex_unlock(&p->lock);
     const char *types[]={"text/plain;charset=utf-8","text/plain",NULL};
+    const char *file_types[]={"text/uri-list","x-special/gnome-copied-files",NULL};
     GVariantBuilder options; g_variant_builder_init(&options,G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&options,"{sv}","mime_types",g_variant_new_strv(types,-1));
+    g_variant_builder_add(&options,"{sv}","mime_types",g_variant_new_strv(files?file_types:types,-1));
     GVariant *reply=g_dbus_connection_call_sync(p->bus,DEST,PATH,CLIPBOARD,"SetSelection",
         g_variant_new("(o@a{sv})",p->session,g_variant_builder_end(&options)),NULL,G_DBUS_CALL_FLAGS_NONE,2000,NULL,NULL);
     if (!reply) {
         pthread_mutex_lock(&p->lock);
         g_free(p->clipboard_text);
-        p->clipboard_text=old_text; p->clipboard_length=old_length;
+        p->clipboard_text=old_text; p->clipboard_length=old_length; p->clipboard_files=old_files;
         pthread_mutex_unlock(&p->lock);
         return -1;
     }
@@ -135,7 +151,22 @@ int uu_portal_clipboard_set(struct uu_portal *p,const uint8_t *text,size_t lengt
     pthread_mutex_unlock(&p->lock);
     return 0;
 }
-/* Hand the text this session is providing to a replacement session, so a session swap (cursor
+int uu_portal_clipboard_set(struct uu_portal *p,const uint8_t *text,size_t length) {
+    return clipboard_set_selection(p,text,length,0);
+}
+int uu_portal_clipboard_set_file(struct uu_portal *p,const uint8_t *uri,size_t length) {
+    if (length<8 || memchr(uri,'\r',length) || memchr(uri,0,length)) return -1;
+    size_t start=0;
+    while (start<length) {
+        const uint8_t *end=memchr(uri+start,'\n',length-start);
+        size_t count=end?(size_t)(end-(uri+start)):length-start;
+        if (count<8 || memcmp(uri+start,"file://",7)) return -1;
+        start+=count+1;
+    }
+    if (uri[length-1]=='\n') return -1;
+    return clipboard_set_selection(p,uri,length,1);
+}
+/* Hand the clipboard data this session is providing to a replacement session, so a session swap (cursor
  * mode, privacy screen, monitor switch) does not drop the viewer's clipboard. Transfers only
  * while this session still owns the selection. Returns 0 transferred, 1 nothing to transfer. */
 int uu_portal_clipboard_copy(struct uu_portal *from, struct uu_portal *to) {
@@ -145,27 +176,44 @@ int uu_portal_clipboard_copy(struct uu_portal *from, struct uu_portal *to) {
     pthread_mutex_lock(&from->lock);
     char *copy=(from->clipboard_owns && from->clipboard_text)?g_memdup2(from->clipboard_text,from->clipboard_length+1):NULL;
     size_t length=from->clipboard_length;
+    int files=from->clipboard_files;
     pthread_mutex_unlock(&from->lock);
     if (!copy) return 1;
-    int result=uu_portal_clipboard_set(to,(const uint8_t *)copy,length);
+    int result=clipboard_set_selection(to,(const uint8_t *)copy,length,files);
     g_free(copy);
     return result==0?0:-1;
 }
-int uu_portal_clipboard_poll(struct uu_portal *p,uint8_t *out,size_t capacity) {
+static int clipboard_poll_selection(struct uu_portal *p,uint8_t *out,size_t capacity,int files) {
     if (!out || !uu_portal_clipboard_ready(p) || capacity<CLIP_LIMIT) return -1;
     pthread_mutex_lock(&p->lock);
-    char *mime=p->clipboard_changed?g_strdup(p->clipboard_mime):NULL; p->clipboard_changed=0;
+    int is_file=p->clipboard_mime && (!strcmp(p->clipboard_mime,"text/uri-list") || !strcmp(p->clipboard_mime,"x-special/gnome-copied-files"));
+    char *mime=(p->clipboard_changed && is_file==files)?g_strdup(p->clipboard_mime):NULL;
+    if (mime) p->clipboard_changed=0;
     uint64_t revision=p->clipboard_revision;
     pthread_mutex_unlock(&p->lock);
     if (!mime) return -1;
     int fd=clipboard_fd(p,"SelectionRead",g_variant_new("(os)",p->session,mime)); g_free(mime);
-    if (fd<0) { if (getenv("UU_CLIPBOARD_DIAGNOSTICS")) fprintf(stderr,"Portal clipboard read: fd unavailable\n"); return -1; }
+    if (fd<0) return -1;
     uint8_t *buffer=g_malloc(CLIP_LIMIT+1); int length=clipboard_io(fd,buffer,CLIP_LIMIT+1,0); close(fd);
-    if (getenv("UU_CLIPBOARD_DIAGNOSTICS")) fprintf(stderr,"Portal clipboard read: length=%d\n",length);
     pthread_mutex_lock(&p->lock);
     if (p->clipboard_revision!=revision) length=-1;
     if (length>=0 && length<=CLIP_LIMIT && g_utf8_validate((const char *)buffer,length,NULL)) memcpy(out,buffer,(size_t)length);
     else length=-1;
     pthread_mutex_unlock(&p->lock);
     g_free(buffer); return length;
+}
+
+int uu_portal_clipboard_poll(struct uu_portal *p,uint8_t *out,size_t capacity) {
+    return clipboard_poll_selection(p,out,capacity,0);
+}
+int uu_portal_clipboard_poll_files(struct uu_portal *p,uint8_t *out,size_t capacity) {
+    if (!out || !uu_portal_clipboard_ready(p) || capacity<CLIP_LIMIT) return -1;
+    pthread_mutex_lock(&p->lock);
+    int changed=p->clipboard_files_revision!=p->clipboard_revision;
+    p->clipboard_files_revision=p->clipboard_revision;
+    int files=p->clipboard_mime && (!strcmp(p->clipboard_mime,"text/uri-list") || !strcmp(p->clipboard_mime,"x-special/gnome-copied-files"));
+    int available=p->clipboard_changed && files;
+    pthread_mutex_unlock(&p->lock);
+    if (available) return clipboard_poll_selection(p,out,capacity,1);
+    return changed?0:-1; /* invalidate old local files even for unsupported/own selections */
 }
