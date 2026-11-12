@@ -6,7 +6,7 @@
 #define CLIPBOARD "org.freedesktop.portal.Clipboard"
 #define CLIP_LIMIT (30 * 1024)
 static int text_mime(const char *mime) {
-    return !strcmp(mime,"text/plain;charset=utf-8") || !strcmp(mime,"text/plain") || !strcmp(mime,"UTF8_STRING");
+    return !g_ascii_strcasecmp(mime,"text/plain;charset=utf-8") || !strcmp(mime,"text/plain") || !strcmp(mime,"UTF8_STRING");
 }
 static int clipboard_fd(struct uu_portal *p, const char *method, GVariant *args) {
     GUnixFDList *fds=NULL;
@@ -55,7 +55,16 @@ static void selection_owner(GDBusConnection *bus,const gchar *sender,const gchar
     g_variant_get(parameters,"(&o@a{sv})",&session,&options);
     if (!strcmp(session,p->session)) {
         gboolean owner=FALSE; g_variant_lookup(options,"session_is_owner","b",&owner);
-        GVariant *types=g_variant_lookup_value(options,"mime_types",G_VARIANT_TYPE_STRING_ARRAY);
+        GVariant *types=g_variant_lookup_value(options,"mime_types",NULL);
+        /* This Ubuntu 24.04 Portal emits mime_types as (as), observed on the bus;
+         * the Clipboard spec uses as. Accept both without discarding native copies. */
+        if (types && g_variant_is_of_type(types,G_VARIANT_TYPE("(as)"))) {
+            GVariant *array=g_variant_get_child_value(types,0);
+            g_variant_unref(types); types=array;
+        }
+        if (types && !g_variant_is_of_type(types,G_VARIANT_TYPE_STRING_ARRAY)) {
+            g_variant_unref(types); types=NULL;
+        }
         char *selected=NULL;
         if (!owner && types) {
             GVariantIter iter; const char *type; g_variant_iter_init(&iter,types);
